@@ -1,89 +1,114 @@
-from flask import Flask, request
-from flask_cors import CORS
-import asyncio
 import json
+import os 
 import uuid
-from characterai import PyAsyncCAI
+import asyncio
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from characterai import aiocai
 
 app = Flask(__name__)
 CORS(app)
 
-async def create_or_get_chat(char, user_id):
+SAVED_CHATS_FILE = 'saved_chats.json'
+
+
+def get_saved_chat_info(user_id):
     try:
-        token = '246ef273972832232bb94ba683aff963a36a8f3f'
-        client = PyAsyncCAI(token)
+        with open(SAVED_CHATS_FILE, 'r') as file:
+            saved_chats = json.load(file)
+            return saved_chats.get(user_id)
+    except FileNotFoundError:
+        return None
+    except json.JSONDecodeError as e:
+        print(f"Error in get_saved_chat_info: {e}")
+        return None
 
-        chat = await client.chat2.get_chat(char)
-        author = {'author_id': chat['chats'][0]['creator_id']}
-        chat_id = str(uuid.uuid4())
 
+def save_chat_info(user_id, chat_id, char):
+    try:
+        try:
+            with open(SAVED_CHATS_FILE, 'r') as file:
+                saved_chats = json.load(file)
+        except FileNotFoundError:
+            saved_chats = {}
+
+        saved_chats[user_id] = {'chat_id': chat_id, 'char': char}
+
+        with open(SAVED_CHATS_FILE, 'w') as file:
+            json.dump(saved_chats, file)
+    except Exception as e:
+        print(f"Error in save_chat_info: {e}")
+
+
+async def create_or_get_chat(char, user_id, token):
+    try:
+        client = aiocai.Client(token)
+        me = await client.get_me()
+
+        # Check for existing chat
         existing_chat_info = get_saved_chat_info(user_id)
-
         if existing_chat_info:
             return existing_chat_info['chat_id']
-        else:
-            async with client.connect(token) as chat2:
-                response, answer = await chat2.new_chat(char, chat_id, author['author_id'])
-                save_chat_info(user_id, chat_id, char)
-                return chat_id
+
+        # Create new chat
+        async with await client.connect() as chat:
+            new, _ = await chat.new_chat(char, me.id)
+            chat_id = new.chat_id
+            save_chat_info(user_id, chat_id, char)
+            return chat_id
 
     except Exception as e:
         print(f"Error in create_or_get_chat: {e}")
         return None
 
-async def send_message_and_get_response(char, chat_id, message, user_id):
+
+async def send_message_and_get_response(char, chat_id, message, token):
     try:
-        token = '246ef273972832232bb94ba683aff963a36a8f3f'
-        client = PyAsyncCAI(token)
-        chat = await client.chat2.get_chat(char)
-        author = {'author_id': chat['chats'][0]['creator_id']}
+        client = aiocai.Client(token)
+        me = await client.get_me()
 
-        async with client.connect(token) as chat2:
-            data = await chat2.send_message(char, chat_id, message, author)
-            response = data['turn']['candidates'][0]['raw_content']
-
-        return response
+        async with await client.connect() as chat:
+            msg = await chat.send_message(char, chat_id, message)
+            return msg.name, msg.text
 
     except Exception as e:
         print(f"Error in send_message_and_get_response: {e}")
         return None
 
-def get_saved_chat_info(user_id):
+
+def ask(char, message, user_id, token):
     try:
-        with open('saved_chats.json', 'r') as file:
-            saved_chats = json.load(file)
-            return saved_chats.get(user_id)
-    except FileNotFoundError:
-        return None
+        loop = asyncio.get_event_loop()
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
 
-def save_chat_info(user_id, chat_id, char):
-    try:
-        with open('saved_chats.json', 'r') as file:
-            saved_chats = json.load(file)
-    except FileNotFoundError:
-        saved_chats = {}
-
-    saved_chats[user_id] = {'chat_id': chat_id, 'char': char}
-
-    with open('saved_chats.json', 'w') as file:
-        json.dump(saved_chats, file)
-
-@app.route('/ask', methods=['GET'])
-def ask():
-    char = request.args.get('char')
-    message = request.args.get('text')
-    user_id = request.args.get('userID')
-
-    if char and message and user_id:
-        chat_id = asyncio.run(create_or_get_chat(char, user_id))
-
-        if chat_id:
-            result = asyncio.run(send_message_and_get_response(char, chat_id, message, user_id))
-            return str(result) if result is not None else "Error processing request"
+    chat_id = loop.run_until_complete(create_or_get_chat(char, user_id, token))
+    if chat_id:
+        result = loop.run_until_complete(send_message_and_get_response(char, chat_id, message, token))
+        if result:
+            name, response_text = result
+            return f'{name}: {response_text}'
         else:
-            return "Error creating or getting chat"
+            return "Error processing request"
     else:
-        return "Invalid input parameters"
+        return "Error creating or getting chat"
+
+
+@app.route('/ask', methods=['POST'])
+def handle_ask():
+    data = request.json
+    char = data.get('char')
+    message = data.get('message')
+    user_id = data.get('user_id')
+    token = data.get('token')
+
+    if not char or not message or not user_id or not token:
+        return "Invalid input parameters", 400
+
+    response = ask(char, message, user_id, token)
+    return response
+
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
